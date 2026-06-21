@@ -1,8 +1,15 @@
 <script setup>
 import { computed, reactive } from 'vue'
-import { Download, Plus, Delete, DocumentCopy } from '@element-plus/icons-vue'
+import { Download, Plus, Delete, DocumentCopy, CircleCloseFilled, CircleCheckFilled, WarningFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { downloadTextFile, downloadTextFiles, generateFrpcToml, generateStartBat } from '@/utils/tomlGenerator'
+import {
+  buildAccessUrl,
+  downloadTextFile,
+  downloadTextFiles,
+  generateFrpcToml,
+  generateStartBat,
+  validateFrpcConfig,
+} from '@/utils/tomlGenerator'
 
 function createId() {
   if (typeof crypto?.randomUUID === 'function') {
@@ -23,19 +30,31 @@ const frpcForm = reactive({
       name: 'web',
       localPort: 80,
       customDomains: ['nas.shanyexia.top'],
+      locations: [],
     },
   ],
 })
 
 const frpcToml = computed(() => generateFrpcToml(frpcForm))
 const startBat = computed(() => generateStartBat())
+const validation = computed(() => validateFrpcConfig(frpcForm))
+const isConfigValid = computed(() => validation.value.valid)
+
+function proxyHasError(index) {
+  return validation.value.errors.some(
+    (error) => error.proxyIndex === index || error.proxyIndices?.includes(index),
+  )
+}
 
 const accessUrls = computed(() => {
   const urls = []
   for (const proxy of frpcForm.proxies) {
     for (const domain of proxy.customDomains) {
-      const trimmed = domain?.trim()
-      if (trimmed) urls.push(`http://${trimmed}`)
+      const paths = proxy.locations?.length ? proxy.locations : ['']
+      for (const location of paths) {
+        const url = buildAccessUrl(domain, location)
+        if (url) urls.push(url)
+      }
     }
   }
   return urls
@@ -45,7 +64,7 @@ const deploySteps = [
   {
     title: '配置 frpc.toml',
     description:
-      '在本页配置服务端地址、端口、Token、本地端口与自定义域名，下载 frpc.toml 到内网机器',
+      '在本页配置服务端地址、端口、Token、本地端口、自定义域名与 URL 路径前缀，下载 frpc.toml 到内网机器',
   },
   {
     title: '启动 frpc',
@@ -63,11 +82,16 @@ const deploySteps = [
 ]
 
 function addProxy() {
+  const sharedDomains = frpcForm.proxies[0]?.customDomains?.length
+    ? [...frpcForm.proxies[0].customDomains]
+    : []
+
   frpcForm.proxies.push({
     id: createId(),
     name: `web${frpcForm.proxies.length + 1}`,
     localPort: 8080,
-    customDomains: [],
+    customDomains: sharedDomains,
+    locations: [],
   })
 }
 
@@ -80,25 +104,9 @@ function removeProxy(index) {
 }
 
 function validateFrpc() {
-  if (!frpcForm.serverAddr.trim()) {
-    ElMessage.error('请填写服务端 IP 地址')
-    return false
-  }
-  if (!frpcForm.password.trim()) {
-    ElMessage.error('请填写 Token')
-    return false
-  }
-  for (const proxy of frpcForm.proxies) {
-    if (!proxy.name.trim()) {
-      ElMessage.error('请填写代理名称')
-      return false
-    }
-    if (!proxy.customDomains.length) {
-      ElMessage.error(`代理「${proxy.name}」至少需要一个自定义域名`)
-      return false
-    }
-  }
-  return true
+  if (validation.value.valid) return true
+  ElMessage.error(validation.value.errors[0]?.message ?? '配置有误，请检查表单')
+  return false
 }
 
 function handleDownloadFrpc() {
@@ -137,7 +145,7 @@ async function copyToClipboard(text, label) {
       <div>
         <h1>HTTP 虚拟主机配置</h1>
         <p class="subtitle">
-          <span>通过自定义域名访问内网 Web 服务 · 参考</span>
+          <span>通过自定义域名与 URL 路径访问内网 Web 服务 · 参考</span>
           <el-link
             href="https://gofrp.org/zh-cn/docs/examples/vhost-http/"
             target="_blank"
@@ -147,7 +155,9 @@ async function copyToClipboard(text, label) {
           </el-link>
         </p>
       </div>
-      <el-button type="primary" :icon="Download" @click="handleDownloadAll"> 下载配置 </el-button>
+      <el-button type="primary" :icon="Download" :disabled="!isConfigValid" @click="handleDownloadAll">
+        下载配置
+      </el-button>
     </header>
 
     <el-row :gutter="20">
@@ -199,7 +209,12 @@ async function copyToClipboard(text, label) {
 
           <el-divider content-position="left">HTTP 代理列表</el-divider>
 
-          <div v-for="(proxy, index) in frpcForm.proxies" :key="proxy.id" class="proxy-item">
+          <div
+            v-for="(proxy, index) in frpcForm.proxies"
+            :key="proxy.id"
+            class="proxy-item"
+            :class="{ 'proxy-item--error': proxyHasError(index) }"
+          >
             <div class="proxy-item-header">
               <span class="proxy-index">代理 #{{ index + 1 }}</span>
               <el-button
@@ -249,6 +264,24 @@ async function copyToClipboard(text, label) {
                   />
                 </el-select>
               </el-form-item>
+
+              <el-form-item label="URL 路径前缀">
+                <div class="field-with-hint">
+                  <el-select
+                    v-model="proxy.locations"
+                    multiple
+                    filterable
+                    allow-create
+                    default-first-option
+                    autocomplete="off"
+                    placeholder="如 /alice，留空表示匹配该域名下所有路径"
+                    style="width: 100%"
+                  />
+                  <span class="field-hint">
+                    同一域名下多个代理时，为每人指定不同路径；需兜底代理时可填 /
+                  </span>
+                </div>
+              </el-form-item>
             </el-form>
           </div>
 
@@ -291,22 +324,40 @@ async function copyToClipboard(text, label) {
       </el-col>
 
       <el-col :xs="24" :lg="10">
-        <el-card shadow="never" class="preview-card">
+        <el-card shadow="never" class="preview-card" :class="{ 'preview-card--invalid': !isConfigValid }">
           <template #header>
-            <span>配置预览</span>
+            <div class="card-header">
+              <span>配置预览</span>
+              <el-tag v-if="isConfigValid" type="success" size="small" effect="light">
+                <el-icon class="status-tag-icon"><CircleCheckFilled /></el-icon>
+                配置有效
+              </el-tag>
+              <el-tag v-else type="danger" size="small" effect="light">
+                <el-icon class="status-tag-icon"><CircleCloseFilled /></el-icon>
+                {{ validation.errors.length }} 项待修正
+              </el-tag>
+            </div>
           </template>
+
+          <ul v-if="!isConfigValid" class="validation-error-list">
+            <li v-for="(error, index) in validation.errors" :key="index" class="validation-error-item">
+              <el-icon class="validation-error-icon"><WarningFilled /></el-icon>
+              <span class="validation-error-text">{{ error.message }}</span>
+            </li>
+          </ul>
 
           <div class="preview-list">
             <div class="preview-panel">
               <div class="preview-panel-header">
                 <el-tag type="info" size="small">frpc.toml</el-tag>
                 <div class="preview-actions">
-                  <el-button size="small" :icon="Download" @click="handleDownloadFrpc">
+                  <el-button size="small" :icon="Download" :disabled="!isConfigValid" @click="handleDownloadFrpc">
                     下载
                   </el-button>
                   <el-button
                     size="small"
                     :icon="DocumentCopy"
+                    :disabled="!isConfigValid"
                     @click="copyToClipboard(frpcToml, 'frpc.toml')"
                   >
                     复制
@@ -409,7 +460,63 @@ async function copyToClipboard(text, label) {
   color: var(--el-text-color-secondary);
 }
 
+.validation-error-list {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  border: 1px solid var(--el-color-error-light-7);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.validation-error-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--el-color-error-light-9);
+}
+
+.validation-error-item + .validation-error-item {
+  border-top: 1px solid var(--el-color-error-light-7);
+}
+
+.validation-error-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 14px;
+  color: var(--el-color-error);
+}
+
+.validation-error-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--el-text-color-primary);
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.status-tag-icon {
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+
+.proxy-item--error {
+  border-color: var(--el-color-error-light-5);
+  border-left-width: 3px;
+  border-left-color: var(--el-color-error);
+  background: linear-gradient(
+    90deg,
+    var(--el-color-error-light-9) 0%,
+    var(--el-fill-color-lighter) 28px
+  );
+}
+
 .proxy-item {
+  transition:
+    border-color 0.2s,
+    background-color 0.2s;
   padding: 16px;
   margin-bottom: 12px;
   border: 1px solid var(--el-border-color-light);
@@ -496,6 +603,10 @@ async function copyToClipboard(text, label) {
 .preview-card {
   position: sticky;
   top: 20px;
+}
+
+.preview-card--invalid :deep(.el-card__header) {
+  border-bottom-color: var(--el-color-error-light-7);
 }
 
 .preview-list {
